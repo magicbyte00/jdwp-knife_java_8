@@ -778,11 +778,11 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s -t 10.24.0.203 -p 5005 --env
-  %(prog)s -t 10.24.0.203 -p 5005 --props
-  %(prog)s -t 10.24.0.203 -p 5005 --ls /app --ls /tmp
-  %(prog)s -t 10.24.0.203 -p 5005 --cat /etc/passwd
-  %(prog)s -t 10.24.0.203 -p 5005 --all -o dump.txt
+  %(prog)s -t TARGET -p 5005 --env
+  %(prog)s -t TARGET -p 5005 --props
+  %(prog)s -t TARGET -p 5005 --ls /app --ls /tmp
+  %(prog)s -t TARGET -p 5005 --cat /etc/passwd
+  %(prog)s -t TARGET -p 5005 --all -o dump.txt
 """)
     parser.add_argument("-t", "--target", required=True)
     parser.add_argument("-p", "--port", type=int, default=5005)
