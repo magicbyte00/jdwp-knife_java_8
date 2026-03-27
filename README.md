@@ -108,6 +108,5 @@ done
 
 ## Known limitations
 
-- `--cmd` does not capture stdout (use `--ls`/`--cat` instead)
 - `--cat` on large files (100+ MB) may cause OOM on target 
 - `Runtime.exec(String)` splits by spaces — no pipes or redirects in `--cmd` (use `${IFS}` or base64 trick for complex commands)
