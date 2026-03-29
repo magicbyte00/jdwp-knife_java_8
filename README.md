@@ -1,4 +1,4 @@
-# jdwp-knife.py (remaster of jdwp-shellifier)
+# jdwp-knife.py 
 
 JDWP pentest tool. Extracts data from running JVMs via debug wire protocol — no shell, no outbound network, no file writes on target.
 
