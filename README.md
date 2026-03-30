@@ -17,7 +17,7 @@ Based on hugsy's jdwp-shellifier, rewritten for Python 3 with data extraction an
 
 ```bash
 # From source
-git clone https://github.com/zhangir-ospanov/jdwp-knife.git
+git clone https://github.com/s0ld13rr/jdwp-knife.git
 cd jdwp-knife
 python3 setup.py install
 
