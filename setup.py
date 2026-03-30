@@ -14,7 +14,7 @@ setup(
     license="MIT",
     keywords=["jdwp", "java", "pentest", "debug", "rce", "data extraction"],
     entry_points={
-        "console_scripts": ["jdwp-knife = jdwp-knife:main"],
+        "console_scripts": ["jdwp-knife = jdwp_knife:main"],
     },
     python_requires=">=3.6",
     classifiers=[
