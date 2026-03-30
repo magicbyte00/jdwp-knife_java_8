@@ -8,7 +8,6 @@ setup(
     url="https://github.com/s0ld13rr/jdwp-knife",
     author="Zhangir Ospanov",
     author_email="zhangir.ospanov@proton.me",
-    scripts=["jdwp-knife.py"],
     description="Pentest tool for extracting data from JVMs via JDWP protocol",
     long_description=open("README.md", encoding="utf8").read(),
     long_description_content_type="text/markdown",
