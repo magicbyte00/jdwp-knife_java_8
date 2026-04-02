@@ -12,6 +12,7 @@ setup(
     long_description=open("README.md", encoding="utf8").read(),
     long_description_content_type="text/markdown",
     license="MIT",
+    py_modules=["jdwp_knife"],
     keywords=["jdwp", "java", "pentest", "debug", "rce", "data extraction"],
     entry_points={
         "console_scripts": ["jdwp-knife = jdwp_knife:main"],
