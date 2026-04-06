@@ -21,6 +21,10 @@ git clone https://github.com/s0ld13rr/jdwp-knife.git
 cd jdwp-knife
 python3 setup.py install
 
+# From Blackarch repo
+
+sudo pacman -S jdwp-knife
+
 # Or just run directly
 python3 jdwp-knife.py -t TARGET -p 5005 --shell
 ```
