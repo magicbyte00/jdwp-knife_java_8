@@ -22,7 +22,6 @@ cd jdwp-knife
 python3 setup.py install
 
 # From Blackarch repo
-
 sudo pacman -S jdwp-knife
 
 # Or just run directly
