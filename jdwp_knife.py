@@ -279,8 +279,9 @@ class JDWPClient:
 
     # ── Class/Method resolution ─────────────────────────────────────────────
 
-    def allclasses(self):
-        if hasattr(self, 'classes'): return self.classes
+    def allclasses(self, force_refresh=False):
+        if hasattr(self, 'classes') and self.classes and not force_refresh: 
+            return self.classes
         self.socket.sendall(self.create_packet(ALLCLASSES_SIG))
         buf = self.read_reply()
         idx = 0
@@ -298,13 +299,15 @@ class JDWPClient:
         return self.classes
 
     def get_class(self, sig):
-        if sig in self._class_cache: return self._class_cache[sig]
+        if sig in self._class_cache: 
+            return self._class_cache[sig]
+        
+        self.allclasses(force_refresh=True)
         for entry in self.classes:
             if entry["signature"] == sig:
                 self._class_cache[sig] = entry
                 return entry
         return None
-
     def get_methods(self, refTypeId):
         if refTypeId not in self.methods:
             refId = self.fmt(self.referenceTypeIDSize, refTypeId)
@@ -509,23 +512,65 @@ class JDWPClient:
         buf = self.invokestatic(rtCid, tId, getRtMeth["methodId"])
         rtId, _, _ = self.read_tagged_value(buf, 0)
         return rtId, rtCid
-
     def _read_stream_bytes(self, tId, streamId):
-        """Read all bytes from an InputStream via readAllBytes(). Returns string."""
-        isCid = self.get_obj_class(streamId)
-        rabMeth, rabCid = self.find_method_up(isCid, "readAllBytes")
-        if not rabMeth: raise JDWPError("readAllBytes() not found (need Java 9+)")
-        buf = self.invoke(streamId, tId, rabCid, rabMeth["methodId"])
-        baId, _, tag = self.read_tagged_value(buf, 0)
+        """Read all bytes from an InputStream via java.util.Scanner (with auto-loading)."""
+        
+        try:
+            classCls = self.get_class("Ljava/lang/Class;")
+            if classCls:
+                classCid = classCls["refTypeId"]
+                self.get_methods(classCid)
+                forNameMeth = self.find_method(classCid, "forName", "(Ljava/lang/String;)Ljava/lang/Class;")
+                if forNameMeth:
+                    scannerNameArg, _ = self.make_string_arg("java.util.Scanner")
+                    self.invokestatic(classCid, tId, forNameMeth["methodId"], scannerNameArg)
+        except Exception:
+            pass
 
-        if not baId or tag == TAG_VOID:
+        scannerCls = self.get_class("Ljava/util/Scanner;")
+        if not scannerCls:
+            raise JDWPError("java.util.Scanner class could not be loaded dynamically")
+        scCid = scannerCls["refTypeId"]
+        self.get_methods(scCid)
+
+        # Constructor: Scanner(InputStream)
+        ctor = self.find_method(scCid, "<init>", "(Ljava/io/InputStream;)V")
+        if not ctor:
+            raise JDWPError("Scanner(InputStream) constructor not found")
+
+        streamArg = bytes([TAG_OBJECT]) + self.fmt(self.objectIDSize, streamId)
+        buf = self.newinstance(scCid, tId, ctor["methodId"], streamArg)
+        scannerId, _, _ = self.read_tagged_value(buf, 0)
+        if not scannerId:
+            raise JDWPError("NewInstance of Scanner returned null")
+
+        # useDelimiter("\\A")
+        delimMeth = self.find_method(scCid, "useDelimiter", "(Ljava/lang/String;)Ljava/util/Scanner;")
+        if not delimMeth:
+            raise JDWPError("useDelimiter() not found")
+        delimArg, _ = self.make_string_arg("\\A")
+        self.invoke(scannerId, tId, scCid, delimMeth["methodId"], delimArg)
+
+        # hasNext()
+        hasNetMeth = self.find_method(scCid, "hasNext", "()Z")
+        if not hasNetMeth:
+            raise JDWPError("hasNext() not found")
+        buf = self.invoke(scannerId, tId, scCid, hasNetMeth["methodId"])
+        hasMore, _, _ = self.read_tagged_value(buf, 0)
+        if not hasMore:
             return ""
 
-        arrLen = self.array_length(baId)
-        if arrLen == 0: return ""
-        raw = self.read_byte_array(baId, arrLen)
-        return raw.decode('utf-8', errors='replace')
+        # next()
+        nextMeth = self.find_method(scCid, "next", "()Ljava/lang/String;")
+        if not nextMeth:
+            raise JDWPError("next() not found")
+        buf = self.invoke(scannerId, tId, scCid, nextMeth["methodId"])
+        val, _, tag = self.read_tagged_value(buf, 0)
+        if tag == TAG_STRING and val != 0:
+            return self.solve_string(val)
 
+        return ""
+   
     def _read_process_output(self, tId, procId):
         """Read stdout and stderr from a Process object. Returns (stdout, stderr)."""
         procCid = self.get_obj_class(procId)
@@ -673,17 +718,20 @@ def setup_breakpoint(jdwp, break_on):
     print(_info("Breakpoint set (id=%x), waiting..." % rId))
     jdwp.resumevm()
 
-    while True:
-        buf = jdwp.wait_for_event()
-        ret = jdwp.parse_event_breakpoint(buf, rId)
-        if ret is not None: break
+    old_timeout = jdwp.socket.gettimeout()
+    jdwp.socket.settimeout(None)
+    try:
+        while True:
+            buf = jdwp.wait_for_event()
+            ret = jdwp.parse_event_breakpoint(buf, rId)
+            if ret is not None: break
+    finally:
+        jdwp.socket.settimeout(old_timeout)
 
     rId, tId = ret
     print(_ok("Breakpoint hit, thread=%#x" % tId))
     jdwp.clear_event(EVENT_BREAKPOINT, rId)
     return tId
-
-
 ################################################################################
 # --env : System.getenv()
 ################################################################################
@@ -1004,7 +1052,6 @@ def do_shell(jdwp, tId):
 
     def make_prompt():
         display_cwd = cwd
-        # Shorten home dir to ~ if we know it
         return "\033[1;31m%s@%s\033[0m:\033[1;34m%s\033[0m$ " % (
             username, hostname, display_cwd)
 
